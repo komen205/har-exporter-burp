@@ -11,6 +11,7 @@ from javax.swing import JSplitPane;
 from javax.swing import JTabbedPane;
 from javax.swing import JTable;
 from javax.swing import SwingUtilities;
+from javax.swing import JButton, JPanel
 from javax.swing.table import AbstractTableModel;
 from threading import Lock
 from burp import IContextMenuFactory, IContextMenuInvocation
@@ -18,12 +19,11 @@ from javax.swing import JMenuItem
 import json
 import base64
 import string
+import time
+from javax.swing import JPanel, JButton, BoxLayout
+from java.awt import BorderLayout
 
 class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController, AbstractTableModel, IContextMenuFactory):
-    
-    #
-    # implement IBurpExtender
-    #
     
     def	registerExtenderCallbacks(self, callbacks):
         # keep a reference to our callbacks object
@@ -39,47 +39,45 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         self._log = ArrayList()
         self._lock = Lock()
         
-        # main split pane
+        self.setupUI(callbacks)
+
+        # Register as an HTTP listener and context menu factory
+        callbacks.registerHttpListener(self)
+        callbacks.registerContextMenuFactory(self)
+
+
+        return
+    
+    def setupUI(self, callbacks):
+        # Main split pane setup
         self._splitpane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
-        
-        # table of log entries
         logTable = Table(self)
         scrollPane = JScrollPane(logTable)
         self._splitpane.setLeftComponent(scrollPane)
 
-        # tabs with request/response viewers
         tabs = JTabbedPane()
         self._requestViewer = callbacks.createMessageEditor(self, False)
         self._responseViewer = callbacks.createMessageEditor(self, False)
         tabs.addTab("Request", self._requestViewer.getComponent())
         tabs.addTab("Response", self._responseViewer.getComponent())
         self._splitpane.setRightComponent(tabs)
-        
-        # customize our UI components
-        callbacks.customizeUiComponent(self._splitpane)
-        callbacks.customizeUiComponent(logTable)
-        callbacks.customizeUiComponent(scrollPane)
-        callbacks.customizeUiComponent(tabs)
-        
-        # add the custom tab to Burp's UI
-        callbacks.addSuiteTab(self)
-        
-        # register ourselves as an HTTP listener
-        callbacks.registerHttpListener(self)
-        callbacks.registerContextMenuFactory(self)
 
-        return
+        # Create a button
+        button = JButton("Export HAR", actionPerformed=self.exportAllMessages)
+
+        # Create a top-level panel
+        topPanel = JPanel()
+        topPanel.setLayout(BorderLayout())
+        topPanel.add(button, BorderLayout.NORTH)
+        topPanel.add(self._splitpane, BorderLayout.CENTER)
+
+        # Customize and add the top-level panel to Burp's UI
+        callbacks.customizeUiComponent(topPanel)
+
+        # Add the top-level panel as the custom tab in Burp's UI
+        callbacks.addSuiteTab(BurpTab(self, topPanel))
         
-    def createMenuItems(self, invocation):
-        # This is where you create the menu item. 'invocation' contains details about the context menu invocation.
-
-        # Example: Adding a simple menu item
-        menu_list = []
-        menu_item = JMenuItem("Perform Action", actionPerformed=lambda x: self.performAction(invocation))
-        menu_list.append(menu_item)
-
-        return menu_list
-    
+   
     def is_binary(self,data):
         # A simple heuristic to check if data is binary:
         # Check if most of the characters in the data are printable
@@ -115,12 +113,18 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
             return base64.b64encode(byte_data).decode('utf-8')
 
 
+    def exportAllMessages(self, event):
+            # Logic to handle exporting all messages
+            har_entries = []
 
-    def performAction(self, invocation):
-        selected_messages = invocation.getSelectedMessages()
-        if selected_messages:
-            har_entries = [self.convertToHAR(message_info) for message_info in selected_messages]
-            
+            # Loop through all log entries and convert each to a HAR entry
+            for i in range(self._log.size()):
+                logEntry = self._log.get(i)
+                message_info = logEntry._requestResponse
+                timestamp = logEntry._timestamp
+                har_entry = self.convertToHAR(message_info, timestamp)
+                har_entries.append(har_entry)
+
             # Combine all HAR entries into a single HAR log
             har_log = {
                 "log": {
@@ -133,9 +137,9 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
                 }
             }
 
-
             # Save the HAR data to a file
-            self.saveHAR(har_log, "exported_request.har")
+            self.saveHAR(har_log, "exported_requests.har")
+
     
     def split_header(self,header):
         parts = header.split(":", 1)
@@ -144,7 +148,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         else:
             return {"name": header, "value": ""}
         
-    def convertToHAR(self, message_info):
+    def convertToHAR(self, message_info, timestamp):
         # Access the request and response
         request_bytes = message_info.getRequest()
         response_bytes = message_info.getResponse()
@@ -171,7 +175,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         response_status = analyzed_response.getStatusCode() if analyzed_response else 0
         response_body = response_bytes[analyzed_response.getBodyOffset():].tostring() if response_bytes else ""
         response_mime_type = analyzed_response.getStatedMimeType() if analyzed_response else ""
-        
+
+        request_mime_type = ""
+        for header in request_headers:
+            if header.lower().startswith("content-type:"):
+                # Split on ":", then take the second part and strip any leading/trailing whitespace
+                request_mime_type = header.split(":", 1)[1].strip()
+                break
 
         # Extract and format request headers
         request_headers_formatted = [self.split_header(str(header)) for header in request_headers[1:]]  # Exclude the start line
@@ -180,7 +190,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         response_headers_formatted = [self.split_header(str(header)) for header in response_headers[1:]]  # Exclude the status line
 
         har_entry = {
-            "startedDateTime": "",  # You might want to format this timestamp
+            "startedDateTime": timestamp,  # You might want to format this timestamp
             "time": 0,  # You might need to calculate this
             "request": {
                 "method": request_method,
@@ -190,7 +200,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
             "headers": request_headers_formatted,
                 "queryString": [],  # Extract query parameters if needed
                 "postData": {
-                    "mimeType": "",  # You might need to determine this
+                    "mimeType": "application/json",  # You might need to determine this
                     "text": request_body_encoded
                 },
                 "headersSize": -1,  # Burp doesn't expose this directly
@@ -204,7 +214,7 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
             "headers": response_headers_formatted,
                 "content": {
                     "size": len(response_body_bytes) if response_body_bytes else 0,
-                    "mimeType": response_mime_type,
+                    "mimeType": "application/json",
                     "text": response_body_encoded
                 },
                 "redirectURL": "",  # Extract if needed
@@ -246,10 +256,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IMessageEditorController,
         if messageIsRequest:
             return
         
-        # create a new log entry with the message details
+        # Capture the current timestamp
+        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+        # create a new log entry with the message details and timestamp
         self._lock.acquire()
         row = self._log.size()
-        self._log.add(LogEntry(toolFlag, self._callbacks.saveBuffersToTempFiles(messageInfo), self._helpers.analyzeRequest(messageInfo).getUrl()))
+        self._log.add(LogEntry(toolFlag, self._callbacks.saveBuffersToTempFiles(messageInfo), self._helpers.analyzeRequest(messageInfo).getUrl(), timestamp))
         self.fireTableRowsInserted(row, row)
         self._lock.release()
 
@@ -319,7 +332,19 @@ class Table(JTable):
 #
 
 class LogEntry:
-    def __init__(self, tool, requestResponse, url):
+    def __init__(self, tool, requestResponse, url, timestamp):
         self._tool = tool
         self._requestResponse = requestResponse
         self._url = url
+        self._timestamp = timestamp  # Add timestamp attribute
+        
+class BurpTab(ITab):
+    def __init__(self, extender, component):
+        self._extender = extender
+        self._component = component
+
+    def getTabCaption(self):
+        return "Custom Tab"
+
+    def getUiComponent(self):
+        return self._component
